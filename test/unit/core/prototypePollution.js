@@ -43,6 +43,10 @@ describe("Prototype Pollution Protection", function () {
     delete Object.prototype.fetchOptions;
     delete Object.prototype.transformRequest;
     delete Object.prototype.transformResponse;
+    delete Object.prototype.transport;
+    delete Object.prototype.formSerializer;
+    delete Object.prototype.parseReviver;
+    delete Object.prototype.headers;
   });
 
   describe("utils.merge", function () {
@@ -223,6 +227,112 @@ describe("Prototype Pollution Protection", function () {
       assert.strictEqual(Object.prototype.polluted, undefined);
       assert.strictEqual(result.customProp.safe, "value");
       assert.strictEqual(result.customProp.hasOwnProperty("__proto__"), false);
+    });
+
+    it("should not inherit transport from Object.prototype", function () {
+      Object.prototype.transport = { request: function () {} };
+      const result = mergeConfig({}, { url: "/a", transport: undefined });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transport"),
+        false
+      );
+    });
+
+    it("should not inherit transformRequest from Object.prototype", function () {
+      Object.prototype.transformRequest = function () { return "hijacked"; };
+      const result = mergeConfig({}, { url: "/a", transformRequest: undefined });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transformRequest"),
+        false
+      );
+    });
+
+    it("should not inherit transformResponse from Object.prototype", function () {
+      Object.prototype.transformResponse = function () { return "hijacked"; };
+      const result = mergeConfig({}, { url: "/a", transformResponse: undefined });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transformResponse"),
+        false
+      );
+    });
+
+    it("should not inherit arbitrary keys from Object.prototype", function () {
+      Object.prototype.polluted = "yes";
+      const result = mergeConfig({}, { url: "/a", polluted: undefined });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "polluted"),
+        false
+      );
+    });
+
+    it("should not merge Object.prototype values into own nested config objects", function () {
+      Object.prototype.params = { injected: "yes" };
+      Object.prototype.headers = { "X-Injected": "evil" };
+      Object.prototype.formSerializer = { visitor: function () { return false; } };
+
+      const result = mergeConfig({}, {
+        params: { a: "1" },
+        headers: { "X-Own": "1" },
+        formSerializer: { dots: true }
+      });
+
+      assert.strictEqual(result.params.a, "1");
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result.params, "injected"), false);
+      assert.strictEqual(result.headers["X-Own"], "1");
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result.headers, "X-Injected"), false);
+      assert.strictEqual(result.formSerializer.dots, true);
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(result.formSerializer, "visitor"), false);
+    });
+
+    it("should not merge a polluted Object.prototype.params into request params", async function () {
+      Object.prototype.params = { injected: "yes" };
+      let seenParams;
+
+      await axios.get("/x", {
+        params: { a: "1" },
+        adapter: function (config) {
+          seenParams = config.params;
+          return Promise.resolve({
+            data: null,
+            status: 200,
+            statusText: "OK",
+            headers: {},
+            config: config,
+            request: {}
+          });
+        }
+      });
+
+      assert.strictEqual(seenParams.a, "1");
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(seenParams, "injected"), false);
+    });
+
+    it("should not use a polluted Object.prototype.transport for http requests", async function () {
+      this.timeout(10000);
+      let hijacked = false;
+      Object.prototype.transport = {
+        request: function () {
+          hijacked = true;
+          throw new Error("hijacked transport");
+        }
+      };
+
+      const server = await new Promise(function (resolve) {
+        const srv = http.createServer(function (req, res) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end('{"ok":true}');
+        });
+        srv.listen(0, "127.0.0.1", function () { resolve(srv); });
+      });
+      const port = server.address().port;
+
+      try {
+        const res = await axios.get("http://127.0.0.1:" + port + "/", { transport: undefined });
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(hijacked, false);
+      } finally {
+        await new Promise(function (resolve) { server.close(resolve); });
+      }
     });
 
     it("should still merge configs correctly", function () {
