@@ -5,6 +5,78 @@ import AxiosURLSearchParams from '../../../lib/helpers/AxiosURLSearchParams.js';
 import FormData from 'form-data';
 
 describe('helpers::toFormData', function () {
+  const createFormDataSpy = () => {
+    const calls = [];
+    return {
+      calls,
+      append(key, value) {
+        calls.push([key, value]);
+      }
+    };
+  };
+
+  describe('prototype pollution gadgets', function () {
+    afterEach(function () {
+      delete Object.prototype.visitor;
+      delete Object.prototype.maxDepth;
+      delete Object.prototype.dots;
+      delete Object.prototype.indexes;
+      delete Object.prototype.metaTokens;
+    });
+
+    it('should ignore a visitor inherited only from Object.prototype', function () {
+      let called = false;
+      Object.prototype.visitor = () => {
+        called = true;
+        return false;
+      };
+
+      const formData = createFormDataSpy();
+      toFormData({ field: 'value' }, formData);
+
+      assert.strictEqual(called, false);
+      assert.deepStrictEqual(formData.calls, [['field', 'value']]);
+    });
+
+    it('should ignore maxDepth inherited only from Object.prototype', function () {
+      Object.prototype.maxDepth = 0;
+
+      const formData = createFormDataSpy();
+      assert.doesNotThrow(() => toFormData({ nested: { field: 'value' } }, formData));
+      assert.deepStrictEqual(formData.calls, [['nested[field]', 'value']]);
+    });
+
+    it('should ignore serializer options inherited only from Object.prototype', function () {
+      Object.prototype.dots = true;
+      Object.prototype.indexes = true;
+
+      const formData = createFormDataSpy();
+      toFormData({ nested: { field: 'value' }, list: ['a', 'b'] }, formData, {});
+
+      assert.deepStrictEqual(formData.calls, [
+        ['nested[field]', 'value'],
+        ['list[]', 'a'],
+        ['list[]', 'b']
+      ]);
+    });
+
+    it('should still honor own options', function () {
+      let called = false;
+      const formData = createFormDataSpy();
+
+      toFormData({ nested: { field: 'value' } }, formData, {
+        dots: true,
+        visitor(value, key, path, helpers) {
+          called = true;
+          return helpers.defaultVisitor.call(this, value, key, path, helpers);
+        }
+      });
+
+      assert.strictEqual(called, true);
+      assert.deepStrictEqual(formData.calls, [['nested.field', 'value']]);
+    });
+  });
+
   // --- Depth limit tests ---
 
   function nest(depth) {

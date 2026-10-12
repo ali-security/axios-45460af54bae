@@ -428,6 +428,119 @@ describe('supports fetch with nodejs', function () {
       delete Object.prototype.password;
       delete Object.prototype.data;
       delete Object.prototype.paramsSerializer;
+      delete Object.prototype.cache;
+      delete Object.prototype.redirect;
+      delete Object.prototype.mode;
+      delete Object.prototype.referrerPolicy;
+      delete Object.prototype.headers;
+    });
+
+    const withCapturedFetch = async (fn) => {
+      const originalFetch = globalThis.fetch;
+      const captured = [];
+
+      globalThis.fetch = function (input, init) {
+        captured.push({input, init, argumentCount: arguments.length});
+        return Promise.resolve(new Response('ok'));
+      };
+
+      try {
+        await fn(captured);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    };
+
+    it('should ignore Request options inherited only from Object.prototype', async () => {
+      await withCapturedFetch(async (captured) => {
+        pollute('cache', 'no-store');
+        pollute('redirect', 'manual');
+        pollute('mode', 'same-origin');
+        pollute('referrerPolicy', 'unsafe-url');
+
+        try {
+          const response = await fetchAxios.get('/safe-request-options');
+
+          assert.strictEqual(response.data, 'ok');
+          assert.strictEqual(captured.length, 1);
+
+          const request = captured[0].input;
+
+          assert.ok(request instanceof Request);
+          assert.strictEqual(request.cache, 'default');
+          assert.strictEqual(request.redirect, 'follow');
+          assert.strictEqual(request.mode, 'cors');
+          assert.strictEqual(request.referrerPolicy, '');
+        } finally {
+          delete Object.prototype.cache;
+          delete Object.prototype.redirect;
+          delete Object.prototype.mode;
+          delete Object.prototype.referrerPolicy;
+        }
+      });
+    });
+
+    it('should apply own fetchOptions to the Request while keeping Axios-owned fields', async () => {
+      await withCapturedFetch(async (captured) => {
+        const fetchOptions = Object.create({
+          headers: {
+            'X-Injected': 'yes'
+          }
+        });
+        fetchOptions.cache = 'no-store';
+        fetchOptions.redirect = 'error';
+        fetchOptions.credentials = 'omit';
+        fetchOptions.method = 'DELETE';
+
+        const response = await fetchAxios.get('/custom-fetch-options', {
+          headers: {
+            'X-Safe': 'value'
+          },
+          withCredentials: true,
+          fetchOptions
+        });
+
+        assert.strictEqual(response.data, 'ok');
+
+        const request = captured[0].input;
+
+        assert.ok(request instanceof Request);
+        assert.strictEqual(captured[0].argumentCount, 2);
+        assert.strictEqual(Object.getPrototypeOf(captured[0].init), null);
+        assert.deepStrictEqual(Object.keys(captured[0].init), []);
+        assert.strictEqual(request.method, 'GET');
+        assert.strictEqual(request.headers.get('X-Safe'), 'value');
+        assert.strictEqual(request.headers.get('X-Injected'), null);
+        assert.strictEqual(request.cache, 'no-store');
+        assert.strictEqual(request.redirect, 'error');
+        assert.strictEqual(request.credentials, 'include');
+      });
+    });
+
+    it('should not let inherited Object.prototype.headers replace the request headers', async () => {
+      server = await startHTTPServer((req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          authorization: req.headers.authorization || null,
+          good: req.headers['x-good'] || null
+        }));
+      });
+
+      pollute('headers', {Authorization: 'Bearer POLLUTED'});
+
+      try {
+        for (const fetchOptions of [undefined, {}]) {
+          const {data} = await fetchAxios.get('/', {
+            headers: {'X-Good': 'yes'},
+            fetchOptions
+          });
+
+          assert.strictEqual(data.authorization, null);
+          assert.strictEqual(data.good, 'yes');
+        }
+      } finally {
+        delete Object.prototype.headers;
+      }
     });
 
     it('should ignore inherited nested auth fields', async () => {
