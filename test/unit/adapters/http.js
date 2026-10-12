@@ -228,6 +228,69 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should sanitize request headers containing CRLF characters', async function () {
+    server = await startHTTPServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({
+        xTest: req.headers['x-test'],
+        injected: req.headers.injected === undefined ? null : req.headers.injected
+      }));
+    });
+
+    const {data} = await axios.get(`http://localhost:${server.address().port}/`, {
+      headers: {
+        'x-test': '\tok\r\nInjected: yes '
+      }
+    });
+
+    assert.strictEqual(data.xTest, 'okInjected: yes');
+    assert.strictEqual(data.injected, null);
+  });
+
+  it('should not smuggle a second request through CRLF sequences in header values', async function () {
+    const rawRequests = [];
+
+    server = await startHTTPServer((req, res) => {
+      rawRequests.push({method: req.method, url: req.url, headers: req.headers});
+      res.end('ok');
+    });
+
+    await axios.get(`http://localhost:${server.address().port}/first`, {
+      headers: {
+        'x-test': 'ok\r\n\r\nPUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\nX-aws-ec2-metadata-token-ttl-seconds: 21600\r\n\r\n'
+      }
+    });
+
+    await setTimeoutAsync(100);
+
+    assert.strictEqual(rawRequests.length, 1);
+    assert.strictEqual(rawRequests[0].method, 'GET');
+    assert.strictEqual(rawRequests[0].url, '/first');
+    assert.strictEqual(rawRequests[0].headers['x-aws-ec2-metadata-token-ttl-seconds'], undefined);
+    assert.strictEqual(
+      rawRequests[0].headers['x-test'],
+      'okPUT /latest/api/token HTTP/1.1Host: 169.254.169.254X-aws-ec2-metadata-token-ttl-seconds: 21600'
+    );
+  });
+
+  it('should preserve request error for unavailable host with invalid header characters', async function () {
+    let error;
+
+    try {
+      await axios.get('http://localhost:1/', {
+        headers: {
+          'x-test': 'ok\r\nInjected: yes'
+        }
+      });
+    } catch (err) {
+      error = err;
+    }
+
+    assert.ok(error, 'request should not succeed');
+    assert.notStrictEqual(error.code, 'ERR_INVALID_CHAR');
+    assert.ok(!/Invalid character in header content/.test(error.message), error.message);
+  });
+
   it('should parse the timeout property', function (done) {
 
     server = http.createServer(function (req, res) {
@@ -1358,6 +1421,62 @@ describe('supports http with nodejs', function () {
     try {
       await assert.rejects(axios.get('http://[::1]:1/', { timeout: 100 }));
       assert.equal(proxyRequests, 0, 'should not use proxy for IPv6 loopback');
+    } finally {
+      await stopHTTPServer(proxy);
+
+      if (originalHttpProxy === undefined) {
+        delete process.env.http_proxy;
+      } else {
+        process.env.http_proxy = originalHttpProxy;
+      }
+
+      if (originalHTTPProxy === undefined) {
+        delete process.env.HTTP_PROXY;
+      } else {
+        process.env.HTTP_PROXY = originalHTTPProxy;
+      }
+
+      if (originalNoProxy === undefined) {
+        delete process.env.no_proxy;
+      } else {
+        process.env.no_proxy = originalNoProxy;
+      }
+
+      if (originalNOProxy === undefined) {
+        delete process.env.NO_PROXY;
+      } else {
+        process.env.NO_PROXY = originalNOProxy;
+      }
+    }
+  });
+
+  it('should not use proxy for loopback IP aliases when no_proxy is localhost', async () => {
+    const originalHttpProxy = process.env.http_proxy;
+    const originalHTTPProxy = process.env.HTTP_PROXY;
+    const originalNoProxy = process.env.no_proxy;
+    const originalNOProxy = process.env.NO_PROXY;
+
+    let proxyRequests = 0;
+    const proxy = await startHTTPServer(
+      (_, response) => {
+        proxyRequests += 1;
+        response.end('proxied');
+      },
+      { port: PROXY_PORT }
+    );
+
+    const proxyUrl = `http://localhost:${proxy.address().port}/`;
+    process.env.http_proxy = proxyUrl;
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.no_proxy = 'localhost';
+    process.env.NO_PROXY = 'localhost';
+
+    try {
+      await assert.rejects(axios.get('http://127.0.0.1:1/', { timeout: 100 }));
+      assert.equal(proxyRequests, 0, 'should not use proxy for IPv4 loopback alias');
+
+      await assert.rejects(axios.get('http://[::1]:1/', { timeout: 100 }));
+      assert.equal(proxyRequests, 0, 'should not use proxy for IPv6 loopback alias');
     } finally {
       await stopHTTPServer(proxy);
 

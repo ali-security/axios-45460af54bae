@@ -158,4 +158,18 @@ describe('headers', function () {
     });
 
   });
+
+  it('should sanitize request headers containing CRLF characters', function (done) {
+    axios('/foo', {
+      headers: {
+        'x-test': '\tok\r\nInjected: yes '
+      }
+    });
+
+    getAjaxRequest().then(function (request) {
+      testHeaderValue(request.requestHeaders, 'x-test', 'okInjected: yes');
+      testHeaderValue(request.requestHeaders, 'Injected', undefined);
+      done();
+    }).catch(done);
+  });
 });
