@@ -59,7 +59,7 @@ const buildConfig = ({es5, browser = true, minifiedVersion = true, alias, ...con
 };
 
 export default async () => {
-  const year = new Date().getFullYear();
+  const year = 2025; // pinned to the release year (1.8.3 released 2025-03-12) so rebuilt dist/ banners match the published tarball
   const banner = `/*! Axios v${lib.version} Copyright (c) ${year} ${lib.author} and contributors */`;
 
   return [
