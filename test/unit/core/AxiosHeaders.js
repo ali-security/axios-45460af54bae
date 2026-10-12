@@ -109,6 +109,91 @@ describe('AxiosHeaders', function () {
 
       assert.strictEqual(headers.get('x-test'), 'okInjected: yes');
     });
+
+    it('should not use inherited Symbol.iterator as a key-value source object', function () {
+      try {
+        Object.prototype[Symbol.iterator] = function* () {
+          yield ['x-app', 'changed'];
+          yield ['x-injected', 'yes'];
+        };
+
+        const headers = new AxiosHeaders({
+          'x-app': 'safe'
+        });
+
+        assert.strictEqual(headers.get('x-app'), 'safe');
+        assert.strictEqual(headers.get('x-injected'), undefined);
+      } finally {
+        delete Object.prototype[Symbol.iterator];
+      }
+    });
+
+    it('should not read polluted Object.prototype Symbol.iterator accessors', function () {
+      let accessed = false;
+
+      try {
+        Object.defineProperty(Object.prototype, Symbol.iterator, {
+          configurable: true,
+          get() {
+            accessed = true;
+            throw new Error('polluted iterator accessor');
+          }
+        });
+
+        const headers = new AxiosHeaders({
+          'x-app': 'safe'
+        });
+
+        assert.strictEqual(headers.get('x-app'), 'safe');
+        assert.strictEqual(accessed, false);
+      } finally {
+        delete Object.prototype[Symbol.iterator];
+      }
+    });
+
+    it('should not use a polluted Object.prototype Symbol.toStringTag to reject plain header objects', function () {
+      try {
+        Object.prototype[Symbol.toStringTag] = 'Headers';
+
+        const headers = new AxiosHeaders({
+          'x-app': 'safe'
+        });
+
+        assert.strictEqual(headers.get('x-app'), 'safe');
+      } finally {
+        delete Object.prototype[Symbol.toStringTag];
+      }
+    });
+
+    it('should not consume an inherited Symbol.iterator for non-plain header sources', function () {
+      try {
+        Object.prototype[Symbol.iterator] = function* () {
+          yield ['x-injected', 'yes'];
+          yield ['authorization', 'Bearer CHANGED'];
+        };
+
+        // A class instance and an Object.create(...) object both have a direct
+        // prototype other than Object.prototype, yet their only iterator comes
+        // from the polluted Object.prototype — they must not be iterated.
+        class HeaderBag {
+          constructor() {
+            this['authorization'] = 'Bearer VALID';
+          }
+        }
+
+        const fromClass = new AxiosHeaders(new HeaderBag());
+        assert.strictEqual(fromClass.get('x-injected'), undefined);
+        assert.notStrictEqual(fromClass.get('authorization'), 'Bearer CHANGED');
+
+        const created = Object.create({'x-app': 'safe'});
+        created['authorization'] = 'Bearer VALID';
+        const fromCreate = new AxiosHeaders(created);
+        assert.strictEqual(fromCreate.get('x-injected'), undefined);
+        assert.notStrictEqual(fromCreate.get('authorization'), 'Bearer CHANGED');
+      } finally {
+        delete Object.prototype[Symbol.iterator];
+      }
+    });
   });
 
   it('should support uppercase name mapping for names overlapped by class methods', () => {

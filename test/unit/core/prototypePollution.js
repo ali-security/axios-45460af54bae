@@ -3,6 +3,7 @@
 import assert from "assert";
 import utils from "../../../lib/utils.js";
 import mergeConfig from "../../../lib/core/mergeConfig.js";
+import axios from "../../../index.js";
 
 describe("Prototype Pollution Protection", function () {
   afterEach(function () {
@@ -221,6 +222,132 @@ describe("Prototype Pollution Protection", function () {
         result.headers.common["Content-Type"],
         "application/json",
       );
+    });
+  });
+
+  describe("request construction gadgets (GHSA-mmx7-hfxf-jppx / GHSA-7q8q-rj6j-mhjq)", function () {
+    const pollute = (key, value) => {
+      Object.defineProperty(Object.prototype, key, {
+        value,
+        configurable: true,
+        writable: true,
+      });
+    };
+
+    const echoAdapter = (onConfig) =>
+      function adapter(config) {
+        onConfig(config);
+
+        return Promise.resolve({
+          data: null,
+          status: 200,
+          statusText: "OK",
+          headers: {},
+          config,
+          request: {},
+        });
+      };
+
+    afterEach(function () {
+      delete Object.prototype.data;
+      delete Object.prototype.serialize;
+      delete Object.prototype.encode;
+      delete Object.prototype.paramsSerializer;
+    });
+
+    it("should ignore inherited data for bodyless method helpers", async function () {
+      pollute("data", "inherited-body");
+
+      try {
+        const seen = [];
+
+        await Promise.all(
+          ["delete", "get", "head", "options"].map(function (method) {
+            return axios[method]("/test", {
+              adapter: echoAdapter(function (config) {
+                seen.push([method, config.data]);
+              }),
+            });
+          }),
+        );
+
+        assert.strictEqual(seen.length, 4);
+        seen.forEach(function (entry) {
+          assert.strictEqual(entry[1], undefined, entry[0] + " sent an inherited body");
+        });
+      } finally {
+        delete Object.prototype.data;
+      }
+    });
+
+    it("should still send own data for bodyless method helpers", async function () {
+      let seenData;
+
+      await axios.delete("/test", {
+        data: "own-body",
+        adapter: echoAdapter(function (config) {
+          seenData = config.data;
+        }),
+      });
+
+      assert.strictEqual(seenData, "own-body");
+    });
+
+    it("should ignore inherited nested serializer fields in getUri", function () {
+      let serializeInvoked = false;
+
+      pollute("serialize", function () {
+        serializeInvoked = true;
+        return "inherited=1";
+      });
+
+      try {
+        assert.strictEqual(
+          axios.getUri({
+            url: "/foo",
+            params: { value: "a b" },
+            paramsSerializer: {},
+          }),
+          "/foo?value=a+b",
+        );
+        assert.strictEqual(serializeInvoked, false);
+      } finally {
+        delete Object.prototype.serialize;
+      }
+    });
+
+    it("should ignore an inherited paramsSerializer in getUri and requests", async function () {
+      let serializerInvoked = false;
+      let seenSerializer;
+
+      pollute("paramsSerializer", function () {
+        serializerInvoked = true;
+        return "inherited=1";
+      });
+
+      try {
+        assert.strictEqual(
+          axios.getUri({
+            url: "/foo",
+            params: { value: "a b" },
+          }),
+          "/foo?value=a+b",
+        );
+
+        await axios.get("/foo", {
+          params: { value: "a b" },
+          adapter: echoAdapter(function (config) {
+            seenSerializer = Object.prototype.hasOwnProperty.call(config, "paramsSerializer")
+              ? config.paramsSerializer
+              : undefined;
+          }),
+        });
+
+        assert.strictEqual(seenSerializer, undefined);
+        assert.strictEqual(serializerInvoked, false);
+      } finally {
+        delete Object.prototype.paramsSerializer;
+      }
     });
   });
 });

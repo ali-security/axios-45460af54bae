@@ -412,4 +412,252 @@ describe('supports fetch with nodejs', function () {
 
     assert.strictEqual(headers.get('foo'), 'bar');
   });
+
+  describe('prototype pollution gadgets', function () {
+    const pollute = (key, value) => {
+      Object.defineProperty(Object.prototype, key, {
+        value,
+        configurable: true,
+        writable: true
+      });
+    };
+
+    afterEach(function () {
+      delete Object.prototype.username;
+      delete Object.prototype.password;
+      delete Object.prototype.data;
+      delete Object.prototype.paramsSerializer;
+    });
+
+    it('should ignore inherited nested auth fields', async () => {
+      server = await startHTTPServer((req, res) => res.end(req.headers.authorization));
+
+      pollute('username', 'inherited-user');
+      pollute('password', 'inherited-pass');
+
+      try {
+        const response = await fetchAxios.get('/', {
+          auth: {}
+        });
+
+        assert.strictEqual(response.data, 'Basic Og==');
+      } finally {
+        delete Object.prototype.username;
+        delete Object.prototype.password;
+      }
+    });
+
+    it('should not send an inherited data value as the body of bodyless requests', async () => {
+      server = await startHTTPServer((req, res) => {
+        let body = '';
+        req.setEncoding('utf8');
+        req.on('data', (chunk) => {
+          body += chunk;
+        });
+        req.on('end', () => {
+          res.end(body);
+        });
+      });
+
+      pollute('data', '{"injected":true}');
+
+      try {
+        const {data} = await fetchAxios.delete('/');
+
+        assert.strictEqual(data, '');
+      } finally {
+        delete Object.prototype.data;
+      }
+    });
+
+    it('should ignore an inherited paramsSerializer', async () => {
+      let serializerInvoked = false;
+
+      server = await startHTTPServer((req, res) => res.end(req.url));
+
+      pollute('paramsSerializer', function () {
+        serializerInvoked = true;
+        return 'inherited=1';
+      });
+
+      try {
+        const {data} = await fetchAxios.get('/demo', {
+          params: {value: 'a b'}
+        });
+
+        assert.strictEqual(serializerInvoked, false);
+        assert.strictEqual(data, '/demo?value=a+b');
+      } finally {
+        delete Object.prototype.paramsSerializer;
+      }
+    });
+  });
+
+  describe('size limits', function () {
+    // Mirrors the adapter's own request-stream feature detection: runtimes
+    // without request-stream support must refuse (ERR_NOT_SUPPORT) a stream
+    // whose size cannot be enforced instead of silently sending it.
+    const supportsRequestStream = () => {
+      try {
+        let duplexAccessed = false;
+
+        const hasContentType = new Request('http://localhost', {
+          body: new ReadableStream(),
+          method: 'POST',
+          get duplex() {
+            duplexAccessed = true;
+            return 'half';
+          }
+        }).headers.has('Content-Type');
+
+        return duplexAccessed && !hasContentType;
+      } catch (e) {
+        return false;
+      }
+    };
+
+    const makeUploadStream = (totalBytes, chunkSize = 512) => {
+      let remaining = totalBytes;
+
+      return new ReadableStream({
+        pull(controller) {
+          if (remaining <= 0) {
+            controller.close();
+            return;
+          }
+
+          const size = Math.min(chunkSize, remaining);
+          remaining -= size;
+          controller.enqueue(new Uint8Array(size));
+        }
+      });
+    };
+
+    const assertBodyLimitError = (err) => {
+      if (supportsRequestStream()) {
+        assert.strictEqual(err.code, 'ERR_BAD_REQUEST');
+        assert.strictEqual(err.message, 'Request body larger than maxBodyLength limit');
+      } else {
+        assert.strictEqual(err.code, 'ERR_NOT_SUPPORT');
+      }
+      return true;
+    };
+
+    const startCountingServer = async (counter) => startHTTPServer((req, res) => {
+      req.on('data', (chunk) => {
+        counter.bytes += chunk.length;
+      });
+      req.on('error', () => {});
+      req.on('end', () => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({received: counter.bytes}));
+      });
+    });
+
+    it('should reject a known-size outbound body that exceeds maxBodyLength before dispatch', async () => {
+      const counter = {bytes: 0};
+      server = await startCountingServer(counter);
+
+      await assert.rejects(
+        fetchAxios.post('/', 'A'.repeat(2048), {
+          maxBodyLength: 1024,
+          headers: {'Content-Type': 'text/plain'}
+        }),
+        (err) => {
+          assert.strictEqual(err.code, 'ERR_BAD_REQUEST');
+          assert.strictEqual(err.message, 'Request body larger than maxBodyLength limit');
+          return true;
+        }
+      );
+
+      assert.strictEqual(counter.bytes, 0);
+    });
+
+    it('should reject a streamed outbound body that exceeds maxBodyLength during upload', async () => {
+      const counter = {bytes: 0};
+      server = await startCountingServer(counter);
+
+      await assert.rejects(
+        fetchAxios.post('/', makeUploadStream(2048), {
+          maxBodyLength: 1024,
+          headers: {'Content-Type': 'application/octet-stream'}
+        }),
+        assertBodyLimitError
+      );
+
+      assert.ok(
+        counter.bytes <= 1024,
+        'server should not receive more than maxBodyLength; got ' + counter.bytes
+      );
+    });
+
+    it('should reject a 2MB stream.Readable body with a 1024 byte maxBodyLength', async () => {
+      const counter = {bytes: 0};
+      server = await startCountingServer(counter);
+
+      await assert.rejects(
+        fetchAxios.post('/', stream.Readable.from([Buffer.alloc(2 * 1024 * 1024, 0x61)]), {
+          maxBodyLength: 1024,
+          headers: {'Content-Type': 'application/octet-stream'}
+        }),
+        assertBodyLimitError
+      );
+
+      assert.ok(
+        counter.bytes <= 64 * 1024,
+        'server should not receive the full payload; got ' + counter.bytes
+      );
+    });
+
+    it('should enforce maxBodyLength on a stream even when a smaller Content-Length is declared', async () => {
+      const counter = {bytes: 0};
+      server = await startCountingServer(counter);
+
+      await assert.rejects(
+        // A caller-declared Content-Length that under-reports the real body
+        // must not let an oversized stream slip past the limit.
+        fetchAxios.post('/', makeUploadStream(8192), {
+          maxBodyLength: 1024,
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': '500'
+          }
+        }),
+        assertBodyLimitError
+      );
+
+      assert.ok(
+        counter.bytes <= 1024,
+        'server should not receive more than maxBodyLength; got ' + counter.bytes
+      );
+    });
+
+    it('should allow a streamed outbound body at or below maxBodyLength', async function () {
+      if (!supportsRequestStream()) {
+        this.skip();
+        return;
+      }
+
+      const counter = {bytes: 0};
+      server = await startCountingServer(counter);
+
+      const {data} = await fetchAxios.post('/', makeUploadStream(1024), {
+        maxBodyLength: 1024,
+        headers: {'Content-Type': 'application/octet-stream'}
+      });
+
+      assert.strictEqual(data.received, 1024);
+    });
+
+    it('should not limit streamed bodies when maxBodyLength is not set', async function () {
+      const counter = {bytes: 0};
+      server = await startCountingServer(counter);
+
+      const {data} = await fetchAxios.post('/', makeUploadStream(4096), {
+        headers: {'Content-Type': 'application/octet-stream'}
+      });
+
+      assert.strictEqual(data.received, 4096);
+    });
+  });
 });
